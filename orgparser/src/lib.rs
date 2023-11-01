@@ -16,161 +16,20 @@
 //!
 //! This crate does not deal with writing the tree to {insert target markup language}.
 //!
+//! However, converting the tree to a markup language allows for testing the 
+//! parser by converting it to markup (and testing the converter by converting
+//! to org).
 //!
-//! ## References
+//! ## Org syntax/structure
 //!
-//! - [Org-mode's developer guide to the syntax](https://orgmode.org/worg/org-syntax.html)
-//! - [Tutorial on parsing org mode format into a tree structure](http://xahlee.info/emacs/emacs/elisp_parse_org_mode.html)
-use std::{convert::TryFrom, fmt::Display};
-
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-
-// -----------------------------------------------------------------------------
-// Errors
-// -----------------------------------------------------------------------------
-
-pub type BoxedError = std::boxed::Box<dyn 
-    std::error::Error   // required to satisfy ?
-    + std::marker::Send // required for threads
-    + std::marker::Sync // required for threads
->;
-
-pub type Result<T> = std::Result<T, BoxedError>;
-
-// -----------------------------------------------------------------------------
-// Reference Example (this will be referred to throughout):
-// -----------------------------------------------------------------------------
-
-/*
-org syntax example
-
-* header
-#+TITLE: Tasks
-* TODO [#A] hh.1 :tag1:tag2:
-:PROPERTIES:
-:OWNER: Dav
-:ID: 123
-:END:
-*some* thing in water
-** hh.1.1
-unordered lists
-- bold *love*
-- italic /slanted text/
-- underline _undies_
-- verbatim =as is=
-- code ~1+1=3~ but +wrong+
-#+BEGIN_CENTER
-does not compute
-#+END_CENTER
-*** hh.1.1.1
-#+BEGIN_EXAMPLE
-var x = 3
-x + 4
-#+END_EXAMPLE
-*** hh.1.1.2
-DEADLINE: <2019-01-25 Fri>
-learn emacs lisp
-#+BEGIN_SRC emacs-lisp
-(+ 3 4)
-#+END_SRC
-** hh.1.2
-** hh.1.3
-* hh.2
-** hh.2.1
-another date [2019-01-25 Fri]
-more date <2019-01-25 Fri 20:08>
-*/
-
-
-// > Any Org document is represented by a sequence of elements, that can 
-// > recursively contain other elements and/or objects.
-
-// -----------------------------------------------------------------------------
-// SECTION TITLE
-// -----------------------------------------------------------------------------
-
-// The syntax can be divided into "elements" and "objects".
-
-/// An `Element` is something that exists at the same or greater scope than a 
-/// paragraph. `Element`s can be divided, from broadest to narrowest scope, 
-/// into headings, sections, greater elements and lesser elements.
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum Element<'a> {
-    Heading {
-        level: HeadingLevel,
-        keyword: Option<String>,
-    },
-    Section,
-    GreaterElement,
-    LesserElement,
-}
-
-/// The end of an `Element`
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum ElementEnd {
-    Heading,
-    Section,
-    GreaterElement,
-    LesserElement,
-}
-
-pub enum Object<'a> {
-    PlainText,
-    Markup(MarkupType),
-    // TODO: Entity,
-    // TODO: LaTeXFragment,
-    Superscript,
-    Subscript,
-}
-
-pub enum ObjectEnd { }
-
-
-pub enum MarkupType {
-    Bold,
-    Italic,
-    Underline,
-    Verbatim,
-    Code,
-    StrikeThru,
-}
-
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum HeadingLevel {
-    H1 = 1,
-    H2,
-    H3,
-    H4,
-    H5,
-    H6,
-}
-
-
-/// Returned when trying to convert a `usize` into a `Heading` but it fails
-/// because the usize isn't a valid heading level
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
-pub struct InvalidHeadingLevel(usize);
-
-impl TryFrom<usize> for HeadingLevel {
-    type Error = InvalidHeadingLevel;
-
-    fn try_from(value: usize) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(Self::H1),
-            2 => Ok(Self::H2),
-            3 => Ok(Self::H3),
-            4 => Ok(Self::H4),
-            5 => Ok(Self::H5),
-            6 => Ok(Self::H6),
-            _ => Err(InvalidHeadingLevel(value)),
-        }
-    }
-}
-
+//! The syntax can be divided into "elements" and "objects".
+//!
+//! An "object" can be thought of as an inline element, something that can exist 
+//! within the scope of a paragraph.
+//!
+//! An `Element` is something that exists at the same or greater scope than a 
+//! paragraph. `Element`s can be divided, from broadest to narrowest scope, 
+//! into headings, sections, greater elements and lesser elements.
 //!
 //! These sub-classes define categories of syntactic environments: they are 
 //! scopes, and every syntactic component only exists within a specific scope/s,
@@ -186,9 +45,125 @@ impl TryFrom<usize> for HeadingLevel {
 //!
 //! "headings" can contain a section and other headings.
 //!
-//! An "object" can be thought of as an inline element, something that can exist 
-//! within the scope of a paragraph.
 //!
-//! ## The org file structure
+//! ## References
 //!
-//!
+//! - [Org-mode's developer guide to the syntax](https://orgmode.org/worg/org-syntax.html)
+//! - [Tutorial on parsing org mode format into a tree structure](http://xahlee.info/emacs/emacs/elisp_parse_org_mode.html)
+use std::collections::HashMap;
+
+use nom::{
+    bytes::complete::take_until, combinator::map, sequence::{tuple, pair},
+    IResult, Parser, multi::many1_count, AsChar, character::complete::satisfy,
+};
+use nom_supreme::{
+    error::ErrorTree,
+    tag::complete::tag,
+    ParserExt,
+};
+
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
+// -----------------------------------------------------------------------------
+// Top-level error handling
+// -----------------------------------------------------------------------------
+
+/// Provide a boxed error type to propogate errors upwards.
+pub type BoxedError = std::boxed::Box<dyn std::error::Error + std::marker::Send + std::marker::Sync>;
+
+/// Wrap result to leverage `BoxedError`.
+pub type Result<T> = std::result::Result<T, BoxedError>;
+
+// -----------------------------------------------------------------------------
+// Basic combinators
+// -----------------------------------------------------------------------------
+
+pub fn markup<'a>(start: &'a str, end: &'a str) -> (impl FnMut(&'a str) -> IResult<&'a str, &'a str>) {
+    map(tuple((tag(start), take_until(end), tag(end))), |res| res.1)
+}
+
+
+// -----------------------------------------------------------------------------
+// Headings
+// -----------------------------------------------------------------------------
+
+
+/// # Headings
+///
+/// Although headings aren't the smallest unit of syntax, it makes sense to start
+/// coding the parser from here: they are the most important part of the document,
+/// and propvide its structure.
+///
+/// The order they heading elements are described here matches the mandatory 
+/// order they must appear in the document.
+///
+/// ## Examples
+///
+/// `* TODO [#A] Stuff to do today :todo:task:`
+///
+///
+/// ## Deviations from spec
+///
+/// - "reduced level" (an integer), which comes after "level", is excised.
+/// - "headline" is made mandatory.
+///
+///
+/// ## To add to config
+///
+/// - Additional keywords + default of "TODO".
+/// - Priority range + default of 1/2/3.
+///
+pub struct Header<'a> {
+    /// Level is denoted by one or more `*` characters in the document.
+    pub level: usize,
+    /// An optional keyword: by default just "TODO". Configurable.
+    pub keyword: Option<&'a str>,
+    /// An optional integer priority. Configurable.
+    pub priority: Option<usize>,
+    /// The headline string.
+    pub headline: &'a str,
+    /// A set of tags.
+    pub tags: Option<Vec<&'a str>>,
+}
+
+/// Placeholder: the max header size should be configurable.
+pub fn is_valid_header_level<'a>(input: &'a usize) -> bool {
+    let max_header_size: usize = 6;
+    input <= &max_header_size
+}
+
+pub fn header_level(input: &str) -> IResult<&str, usize, ErrorTree<&str>> {
+    many1_count(tag("*"))
+    .verify(is_valid_header_level)
+    .terminated(tag(" "))
+    .context("A header level is denoted by one two six asterisks followed by a space")
+    .parse(input)
+}
+
+pub fn keyword(input: &str) -> IResult<&str, Option<&str>, ErrorTree<&str>> {
+    unimplemented!()    
+}
+
+// TODO: placeholder, need to take the priority cookie & convert it to a useful number.
+// pub fn is_valid_priority(input: char) -> bool {
+//    ORG_PRIORITY_COOKIES.contains(&input)
+// }
+
+pub fn priority(input: &str) -> IResult<&str, Option<&str>, ErrorTree<&str>> {
+   markup("#[", "]")
+   .parse(input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_header_level() {
+        let input = "**** ";
+
+        assert_eq!(header_level(input).unwrap(), ("", 4));
+    }
+}
